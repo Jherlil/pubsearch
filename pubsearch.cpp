@@ -5,10 +5,17 @@
 #include <cstring>
 #include <cassert>
 #include <chrono>
+#include <iomanip>
 #include <immintrin.h>
 #include <secp256k1.h>
 #include <openssl/evp.h> // Usar EVP API em vez de SHA/RIPEMD diretamente
 #include <openssl/err.h>
+
+extern "C" {
+#include "compat.c"
+#include "sha256.c"
+#include "rmd160s.c"
+}
 
 //-----------------------------------------------------------
 // CONFIGURAÇÃO
@@ -52,39 +59,41 @@ static std::string bytes_to_hex(const unsigned char* data, size_t len) {
 }
 
 //-----------------------------------------------------------
-// HASH160 COM EVP API (COMPATÍVEL COM OPENSSL 3.0)
+// HASH160 USANDO IMPLEMENTAÇÕES OTIMIZADAS (SHA256 + RIPEMD160)
 //-----------------------------------------------------------
-static void hash160_avx2(const unsigned char* data[AVX2_LANES], size_t data_len, unsigned char out20[AVX2_LANES][20]) {
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    if (!mdctx) {
-        std::cerr << "EVP_MD_CTX_new failed\n";
-        return;
-    }
+static void hash160_avx2(const unsigned char* data[AVX2_LANES], size_t data_len,
+                         unsigned char out20[AVX2_LANES][20]) {
+    const int BATCH = RMD_LEN;
+    u8 msg[BATCH][64];
+    u32 rs[BATCH][16];
+    u32 r160[BATCH][5];
 
-    for (int i = 0; i < AVX2_LANES; i++) {
-        // SHA256
-        unsigned char sha256_out[32];
-        unsigned int sha256_len;
-        if (!EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr) ||
-            !EVP_DigestUpdate(mdctx, data[i], data_len) ||
-            !EVP_DigestFinal_ex(mdctx, sha256_out, &sha256_len)) {
-            std::cerr << "SHA256 failed\n";
-            EVP_MD_CTX_free(mdctx);
-            return;
+    for (int start = 0; start < AVX2_LANES; start += BATCH) {
+        for (int i = 0; i < BATCH; i++) {
+            int idx = start + i;
+            memcpy(msg[i], data[idx], data_len);
+            memset(msg[i] + data_len, 0, sizeof(msg[i]) - data_len);
+            msg[i][data_len] = 0x80;
+            msg[i][62] = 0x01;
+            msg[i][63] = 0x08;
+            sha256_final(rs[i], msg[i], sizeof(msg[i]));
+            rs[i][8] = 0x80000000;
+            rs[i][14] = 0x00010000;
         }
 
-        // RIPEMD160
-        unsigned int ripemd_len;
-        if (!EVP_DigestInit_ex(mdctx, EVP_ripemd160(), nullptr) ||
-            !EVP_DigestUpdate(mdctx, sha256_out, sha256_len) ||
-            !EVP_DigestFinal_ex(mdctx, out20[i], &ripemd_len)) {
-            std::cerr << "RIPEMD160 failed\n";
-            EVP_MD_CTX_free(mdctx);
-            return;
+        rmd160_batch(r160, rs);
+
+        for (int i = 0; i < BATCH; i++) {
+            int idx = start + i;
+            for (int j = 0; j < 5; j++) {
+                u32 v = r160[i][j];
+                out20[idx][4 * j + 0] = (v >> 24) & 0xFF;
+                out20[idx][4 * j + 1] = (v >> 16) & 0xFF;
+                out20[idx][4 * j + 2] = (v >> 8) & 0xFF;
+                out20[idx][4 * j + 3] = v & 0xFF;
+            }
         }
     }
-
-    EVP_MD_CTX_free(mdctx);
 }
 
 //-----------------------------------------------------------
@@ -229,20 +238,26 @@ static void worker_thread(int thread_id, int num_threads, const secp256k1_pubkey
 }
 
 //-----------------------------------------------------------
-// REPORT Mkeys/s
+// RELATÓRIO DE VELOCIDADE (M/G/Pkeys)
 //-----------------------------------------------------------
-static void report_mkeys_per_second() {
-    static auto start_time = std::chrono::steady_clock::now();
+static void report_speed() {
+    auto last = std::chrono::steady_clock::now();
     while (!g_found.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-        if (elapsed >= 1) {
-            uint64_t keys = g_total_keys.exchange(0, std::memory_order_relaxed);
-            double mkeys_s = keys / (elapsed * 1e6);
-            std::cout << "[Progress] " << mkeys_s << " Mkeys/s\n";
-            start_time = now;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        double elapsed = std::chrono::duration<double>(now - last).count();
+        last = now;
+
+        uint64_t keys = g_total_keys.exchange(0, std::memory_order_relaxed);
+        double rate = keys / elapsed; // keys per second
+        const char* unit = "keys";
+        if (rate >= 1e15) { unit = "Pkeys"; rate /= 1e15; }
+        else if (rate >= 1e9) { unit = "Gkeys"; rate /= 1e9; }
+        else if (rate >= 1e6) { unit = "Mkeys"; rate /= 1e6; }
+        else if (rate >= 1e3) { unit = "Kkeys"; rate /= 1e3; }
+
+        std::cout << "[Progress] " << std::fixed << std::setprecision(2)
+                  << rate << ' ' << unit << "/s\n";
     }
 }
 
@@ -272,8 +287,8 @@ int main() {
               << "  Batch size:    " << BATCH_SIZE << "\n"
               << "  AVX2 lanes:    " << AVX2_LANES << "\n";
 
-    // Iniciar thread para relatar Mkeys/s
-    std::thread reporter(report_mkeys_per_second);
+    // Iniciar thread para relatar a velocidade de busca
+    std::thread reporter(report_speed);
 
     // Lançar threads de trabalho
     std::vector<std::thread> threads;
