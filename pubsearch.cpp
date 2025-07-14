@@ -7,14 +7,9 @@
 #include <chrono>
 #include <iomanip>
 #include <immintrin.h>
-#include <secp256k1.h>
-#include <openssl/evp.h> // Usar EVP API em vez de SHA/RIPEMD diretamente
-#include <openssl/err.h>
 
 extern "C" {
-#include "compat.c"
-#include "sha256.c"
-#include "rmd160s.c"
+#include "addr.c"
 }
 
 //-----------------------------------------------------------
@@ -30,7 +25,6 @@ static const int AVX2_LANES = 8;
 //-----------------------------------------------------------
 static std::atomic<bool> g_found(false);
 static std::atomic<uint64_t> g_total_keys(0);
-static secp256k1_context* g_ctx = nullptr;
 
 //-----------------------------------------------------------
 // HEX / BYTE UTILS
@@ -105,107 +99,107 @@ static bool check_prefix(const unsigned char out20[20]) {
 }
 
 //-----------------------------------------------------------
-// INICIALIZAÇÃO SECP256K1
+// EXPONENTIAÇÃO MOD P
 //-----------------------------------------------------------
-static void init_secp256k1() {
-    if (!g_ctx) {
-        g_ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-        unsigned char seed[32] = {0};
-        if (!secp256k1_context_randomize(g_ctx, seed)) {
-            std::cerr << "Failed to randomize secp256k1 context\n";
-            secp256k1_context_destroy(g_ctx);
-            g_ctx = nullptr;
+static void fe_modp_pow(fe r, const fe a, const fe e) {
+    fe result;
+    fe base;
+    fe_clone(base, a);
+    fe_set64(result, 1);
+    for (int limb = 3; limb >= 0; --limb) {
+        for (int bit = 63; bit >= 0; --bit) {
+            fe_modp_sqr(result, result);
+            if (e[limb] & (1ULL << bit)) {
+                fe_modp_mul(result, result, base);
+            }
         }
     }
+    fe_clone(r, result);
+}
+
+static void fe_modp_sqrt(fe r, const fe a) {
+    static const fe SQRT_EXP = {0xffffffffbfffff0cULL, 0xffffffffffffffffULL,
+                                0xffffffffffffffffULL, 0x3fffffffffffffffULL};
+    fe_modp_pow(r, a, SQRT_EXP);
 }
 
 //-----------------------------------------------------------
 // PARSE E SERIALIZAÇÃO DE PUBKEY
 //-----------------------------------------------------------
-static bool parse_pubkey(const std::string &hex, secp256k1_pubkey &pubkey) {
+static bool parse_pubkey(const std::string &hex, pe &pubkey) {
     std::vector<unsigned char> data = hex_to_bytes(hex);
     if (data.size() != 33) {
         std::cerr << "Invalid compressed pubkey length: " << data.size() << "\n";
         return false;
     }
-    if (!secp256k1_ec_pubkey_parse(g_ctx, &pubkey, data.data(), data.size())) {
-        std::cerr << "Error parsing pubkey\n";
-        return false;
+    bool odd = data[0] & 1;
+    std::string x_hex = hex.substr(2);
+    fe_from_hex(pubkey.x, x_hex.c_str());
+    fe t, seven;
+    fe_modp_sqr(t, pubkey.x);        // x^2
+    fe_modp_mul(t, t, pubkey.x);     // x^3
+    fe_set64(seven, 7);
+    fe_modp_add(t, t, seven);        // x^3 + 7
+    fe_modp_sqrt(pubkey.y, t);       // sqrt
+    if ((pubkey.y[0] & 1ULL) != odd) {
+        fe_modp_sub(pubkey.y, FE_P, pubkey.y);
     }
+    fe_set64(pubkey.z, 1);
     return true;
 }
 
-static std::string serialize_pubkey(const secp256k1_pubkey &pubkey) {
-    unsigned char out[33];
-    size_t outlen = 33;
-    secp256k1_ec_pubkey_serialize(g_ctx, out, &outlen, &pubkey, SECP256K1_EC_COMPRESSED);
-    return bytes_to_hex(out, outlen);
-}
-
-//-----------------------------------------------------------
-// TWEAK ADD
-//-----------------------------------------------------------
-static bool pubkey_tweak_add(secp256k1_pubkey &pubkey, const unsigned char tweak[32]) {
-    return secp256k1_ec_pubkey_tweak_add(g_ctx, &pubkey, tweak) != 0;
-}
-
-//-----------------------------------------------------------
-// INT TO 32 BYTES
-//-----------------------------------------------------------
-static void int_to_32bytes(uint64_t v, unsigned char out[32]) {
-    memset(out, 0, 32);
-    for (int i = 0; i < 8; i++) {
-        out[31 - i] = (unsigned char)((v >> (8 * i)) & 0xFF);
+static void serialize_pubkey(const pe &pubkey, unsigned char out[33]) {
+    out[0] = (pubkey.y[0] & 1ULL) ? 0x03 : 0x02;
+    for (int i = 0; i < 4; ++i) {
+        u64 be = swap64(pubkey.x[3 - i]);
+        memcpy(out + 1 + i * 8, &be, 8);
     }
 }
 
+//-----------------------------------------------------------
+// POINT ADDITION BY SCALAR
+//-----------------------------------------------------------
 //-----------------------------------------------------------
 // WORKER THREAD
 //-----------------------------------------------------------
-static void worker_thread(int thread_id, int num_threads, const secp256k1_pubkey &start_pubkey) {
-    secp256k1_pubkey pubkey_i = start_pubkey;
-    unsigned char tweak_init[32];
-    int_to_32bytes(thread_id, tweak_init);
-    if (!pubkey_tweak_add(pubkey_i, tweak_init)) {
-        std::cerr << "[Thread " << thread_id << "] pubkey_tweak_add(i) failed.\n";
-        return;
-    }
+static void worker_thread(int thread_id, int num_threads, const pe &start_pubkey) {
+    fe tmp;
+    fe_set64(tmp, (u64)thread_id);
+    pe pubkey_i;
+    ec_gtable_mul(&pubkey_i, tmp);
+    ec_jacobi_rdc(&pubkey_i, &pubkey_i);
+    ec_jacobi_addrdc(&pubkey_i, &start_pubkey, &pubkey_i);
 
-    unsigned char tweak_step[32];
-    int_to_32bytes(num_threads, tweak_step);
+    fe step_scalar;
+    fe_set64(step_scalar, (u64)num_threads);
+    pe step;
+    ec_gtable_mul(&step, step_scalar);
+    ec_jacobi_rdc(&step, &step);
 
-    // Buffers para AVX2
-    const unsigned char* compressed[AVX2_LANES]; // Alterado para const
+    pe pubkeys[AVX2_LANES];
+    unsigned char compressed[AVX2_LANES][33];
+    const unsigned char* comp_ptrs[AVX2_LANES];
     unsigned char h160[AVX2_LANES][20];
-    secp256k1_pubkey pubkeys[AVX2_LANES];
 
     for (int i = 0; i < AVX2_LANES; i++) {
-        compressed[i] = new unsigned char[33];
-        pubkeys[i] = pubkey_i;
-        if (i > 0) {
-            unsigned char tweak_lane[32];
-            int_to_32bytes(i * num_threads, tweak_lane);
-            if (!pubkey_tweak_add(pubkeys[i], tweak_lane)) {
-                std::cerr << "[Thread " << thread_id << "] pubkey_tweak_add(lane " << i << ") failed.\n";
-                return;
-            }
+        if (i == 0) {
+            pe_clone(&pubkeys[i], &pubkey_i);
+        } else {
+            ec_jacobi_addrdc(&pubkeys[i], &pubkeys[i-1], &step);
         }
+        comp_ptrs[i] = compressed[i];
     }
 
     while (!g_found.load(std::memory_order_relaxed)) {
         for (int b = 0; b < BATCH_SIZE; b += AVX2_LANES) {
             if (g_found.load(std::memory_order_relaxed)) break;
 
-            // Serializar pubkeys para cada lane
             for (int i = 0; i < AVX2_LANES; i++) {
-                size_t clen = 33;
-                secp256k1_ec_pubkey_serialize(g_ctx, const_cast<unsigned char*>(compressed[i]), &clen, &pubkeys[i], SECP256K1_EC_COMPRESSED);
+                serialize_pubkey(pubkeys[i], compressed[i]);
             }
 
-            // Calcular HASH160 para todas as lanes com AVX2
-            hash160_avx2(compressed, 33, h160);
+            hash160_avx2(comp_ptrs, 33, h160);
 
-            // Verificar prefixos
             for (int i = 0; i < AVX2_LANES; i++) {
                 if (check_prefix(h160[i])) {
                     g_found.store(true, std::memory_order_relaxed);
@@ -218,22 +212,12 @@ static void worker_thread(int thread_id, int num_threads, const secp256k1_pubkey
                 }
             }
 
-            // Incrementar todas as pubkeys
             for (int i = 0; i < AVX2_LANES; i++) {
-                if (!pubkey_tweak_add(pubkeys[i], tweak_step)) {
-                    std::cerr << "[Thread " << thread_id << "] pubkey_tweak_add(step) failed.\n";
-                    break;
-                }
+                ec_jacobi_addrdc(&pubkeys[i], &pubkeys[i], &step);
             }
 
-            // Atualizar contador de chaves
             g_total_keys.fetch_add(AVX2_LANES, std::memory_order_relaxed);
         }
-    }
-
-    // Limpeza
-    for (int i = 0; i < AVX2_LANES; i++) {
-        delete[] compressed[i];
     }
 }
 
@@ -265,13 +249,9 @@ static void report_speed() {
 // MAIN
 //-----------------------------------------------------------
 int main() {
-    init_secp256k1();
-    if (!g_ctx) {
-        std::cerr << "Failed to initialize secp256k1 context\n";
-        return 1;
-    }
+    ec_gtable_init();
 
-    secp256k1_pubkey start_pubkey;
+    pe start_pubkey;
     if (!parse_pubkey(START_PUBKEY_HEX, start_pubkey)) {
         std::cerr << "Failed to parse START_PUBKEY_HEX\n";
         return 1;
@@ -306,10 +286,5 @@ int main() {
     reporter.join();
 
     std::cout << "Done.\n";
-    if (g_ctx) {
-        secp256k1_context_destroy(g_ctx);
-        g_ctx = nullptr;
-    }
-
     return 0;
 }
